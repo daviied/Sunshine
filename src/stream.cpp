@@ -1207,33 +1207,32 @@ namespace stream {
         BOOST_LOG(warning) << "RD: couldn't send cursor message"sv;
       }
     };
-    auto put16 = [](std::vector<std::uint8_t> &v, std::uint16_t x) {
-      v.push_back(x & 0xFF);
-      v.push_back(x >> 8);
+    // Little-endian writes into pre-sized buffers (no push_back: GCC 14 -Werror false positive)
+    auto put16 = [](std::uint8_t *at, std::uint16_t x) {
+      at[0] = x & 0xFF;
+      at[1] = x >> 8;
     };
-    auto put32 = [&](std::vector<std::uint8_t> &v, std::uint32_t x) {
-      put16(v, x & 0xFFFF);
-      put16(v, x >> 16);
+    auto put32 = [&](std::uint8_t *at, std::uint32_t x) {
+      put16(at, x & 0xFFFF);
+      put16(at + 2, x >> 16);
     };
 
     std::uint32_t id = snap.shape ? snap.shape->id : 0;
     if (snap.shape && id != session->control.rd_cursor_sent_id) {
-      std::vector<std::uint8_t> body;
-      body.reserve(12 + snap.shape->bgra.size());
-      put32(body, id);
-      put16(body, snap.shape->width);
-      put16(body, snap.shape->height);
-      put16(body, snap.shape->hot_x);
-      put16(body, snap.shape->hot_y);
-      body.insert(body.end(), snap.shape->bgra.begin(), snap.shape->bgra.end());
+      std::vector<std::uint8_t> body(12 + snap.shape->bgra.size());
+      put32(body.data(), id);
+      put16(body.data() + 4, snap.shape->width);
+      put16(body.data() + 6, snap.shape->height);
+      put16(body.data() + 8, snap.shape->hot_x);
+      put16(body.data() + 10, snap.shape->hot_y);
+      std::copy(snap.shape->bgra.begin(), snap.shape->bgra.end(), body.begin() + 12);
       send_msg(rd_cursor::MSG_CURSOR_SHAPE, body);
       session->control.rd_cursor_sent_id = id;
     }
 
-    std::vector<std::uint8_t> state;
-    put32(state, id);
-    state.push_back(snap.visible ? 1 : 0);
-    state.insert(state.end(), 3, 0);
+    std::vector<std::uint8_t> state(8, 0);
+    put32(state.data(), id);
+    state[4] = snap.visible ? 1 : 0;
     send_msg(rd_cursor::MSG_CURSOR_STATE, state);
     session->control.rd_cursor_seq = snap.seq;
   }
