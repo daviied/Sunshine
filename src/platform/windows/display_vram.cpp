@@ -23,6 +23,7 @@ extern "C" {
 
 // local includes
 #include "display.h"
+#include "src/rd_cursor.h"
 #include "misc.h"
 #include "src/config.h"
 #include "src/logging.h"
@@ -1405,6 +1406,9 @@ namespace platf::dxgi {
       auto alpha_cursor_img = make_cursor_alpha_image(img_data, shape_info);
       auto xor_cursor_img = make_cursor_xor_image(img_data, shape_info);
 
+      // RD: share the shape so clients can draw the cursor locally.
+      rd_cursor::publish_shape(shape_info.Width, shape_info.HotSpot.x, shape_info.HotSpot.y, std::begin(alpha_cursor_img), alpha_cursor_img.size(), xor_cursor_img.size() ? std::begin(xor_cursor_img) : nullptr, xor_cursor_img.size());
+
       if (!set_cursor_texture(device.get(), cursor_alpha, std::move(alpha_cursor_img), shape_info) || !set_cursor_texture(device.get(), cursor_xor, std::move(xor_cursor_img), shape_info)) {
         return capture_e::capture_error;
       }
@@ -1414,9 +1418,12 @@ namespace platf::dxgi {
       cursor_alpha.set_pos(frame_info.PointerPosition.Position.x, frame_info.PointerPosition.Position.y, width, height, display_rotation, frame_info.PointerPosition.Visible);
 
       cursor_xor.set_pos(frame_info.PointerPosition.Position.x, frame_info.PointerPosition.Position.y, width, height, display_rotation, frame_info.PointerPosition.Visible);
+
+      rd_cursor::publish_visible(frame_info.PointerPosition.Visible);
     }
 
-    const bool blend_mouse_cursor_flag = (cursor_alpha.visible || cursor_xor.visible) && cursor_visible;
+    // RD: skip blending while a client draws the cursor locally.
+    const bool blend_mouse_cursor_flag = (cursor_alpha.visible || cursor_xor.visible) && cursor_visible && rd_cursor::local_sessions.load(std::memory_order_relaxed) == 0;
 
     texture2d_t src {};
     if (frame_update_flag) {

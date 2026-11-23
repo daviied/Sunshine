@@ -29,6 +29,7 @@
 #include "network.h"
 #include "platform/common.h"
 #include "process.h"
+#include "rd_cursor.h"
 #include "stream.h"
 #include "sync.h"
 #include "system_tray.h"
@@ -558,6 +559,10 @@ namespace stream {
 
       platf::feedback_queue_t feedback_queue;  ///< Queue of controller feedback awaiting control-channel delivery.
       safe::mail_raw_t::event_t<video::hdr_info_t> hdr_queue;  ///< Queue of HDR metadata awaiting control-channel delivery.
+
+      bool rd_local_cursor = false;  ///< RD: client draws the cursor itself.
+      std::uint64_t rd_cursor_seq = 0;  ///< RD: last cursor state sequence sent.
+      std::uint32_t rd_cursor_sent_id = 0;  ///< RD: last cursor shape id sent.
     } control;  ///< Runtime state for the encrypted GameStream control channel.
 
     std::uint32_t launch_session_id;  ///< RTSP launch-session ID associated with this stream.
@@ -1185,6 +1190,55 @@ namespace stream {
   }
 
   /**
+   * @brief RD: send cursor shape (if changed) and visibility to a local-cursor client.
+   */
+  void send_rd_cursor(session_t *session, const rd_cursor::snapshot_t &snap) {
+    static std::array<std::uint8_t, sizeof(control_encrypted_t) + crypto::cipher::round_to_pkcs7_padded(4 + 12 + rd_cursor::MAX_EDGE * rd_cursor::MAX_EDGE * 4) + crypto::cipher::tag_size> encrypted_payload;
+
+    auto send_msg = [&](std::uint16_t type, const std::vector<std::uint8_t> &body) {
+      std::vector<std::uint8_t> msg(4 + body.size());
+      msg[0] = type & 0xFF;
+      msg[1] = type >> 8;
+      msg[2] = body.size() & 0xFF;
+      msg[3] = (body.size() >> 8) & 0xFF;
+      std::copy(body.begin(), body.end(), msg.begin() + 4);
+      auto payload = encode_control(session, std::string_view {(const char *) msg.data(), msg.size()}, encrypted_payload);
+      if (payload.empty() || session->broadcast_ref->control_server.send(payload, session->control.peer)) {
+        BOOST_LOG(warning) << "RD: couldn't send cursor message"sv;
+      }
+    };
+    auto put16 = [](std::vector<std::uint8_t> &v, std::uint16_t x) {
+      v.push_back(x & 0xFF);
+      v.push_back(x >> 8);
+    };
+    auto put32 = [&](std::vector<std::uint8_t> &v, std::uint32_t x) {
+      put16(v, x & 0xFFFF);
+      put16(v, x >> 16);
+    };
+
+    std::uint32_t id = snap.shape ? snap.shape->id : 0;
+    if (snap.shape && id != session->control.rd_cursor_sent_id) {
+      std::vector<std::uint8_t> body;
+      body.reserve(12 + snap.shape->bgra.size());
+      put32(body, id);
+      put16(body, snap.shape->width);
+      put16(body, snap.shape->height);
+      put16(body, snap.shape->hot_x);
+      put16(body, snap.shape->hot_y);
+      body.insert(body.end(), snap.shape->bgra.begin(), snap.shape->bgra.end());
+      send_msg(rd_cursor::MSG_CURSOR_SHAPE, body);
+      session->control.rd_cursor_sent_id = id;
+    }
+
+    std::vector<std::uint8_t> state;
+    put32(state, id);
+    state.push_back(snap.visible ? 1 : 0);
+    state.insert(state.end(), 3, 0);
+    send_msg(rd_cursor::MSG_CURSOR_STATE, state);
+    session->control.rd_cursor_seq = snap.seq;
+  }
+
+  /**
    * @brief Run the broadcast control-channel worker thread.
    *
    * @param server RTSP server instance handling the request.
@@ -1192,6 +1246,11 @@ namespace stream {
   void controlBroadcastThread(control_server_t *server) {
     server->map(packetTypes[IDX_PERIODIC_PING], [](session_t *session, const std::string_view &payload) {
       BOOST_LOG(verbose) << "type [IDX_PERIODIC_PING]"sv;
+    });
+
+    // RD: client battery level for the host tray icon.
+    server->map(rd_cursor::MSG_CLIENT_BATTERY, [&](session_t *session, const std::string_view &payload) {
+      rd_cursor::write_battery(config::nvhttp.sunshine_name, payload);
     });
 
     server->map(packetTypes[IDX_START_A], [&](session_t *session, const std::string_view &payload) {
@@ -1340,6 +1399,7 @@ namespace stream {
     auto broadcast_shutdown_event = mail::man->event<bool>(mail::broadcast_shutdown);
     while (!shutdown_event->peek() && !broadcast_shutdown_event->peek()) {
       bool has_session_awaiting_peer = false;
+      bool has_local_cursor = false;
 
       {
         auto lg = server->_sessions.lock();
@@ -1395,6 +1455,13 @@ namespace stream {
 
               send_hdr_mode(session, std::move(hdr_info));
             }
+
+            if (session->control.rd_local_cursor) {
+              has_local_cursor = true;
+              if (auto snap = rd_cursor::get(); snap.seq != session->control.rd_cursor_seq) {
+                send_rd_cursor(session, snap);
+              }
+            }
           }
 
           ++pos;
@@ -1407,7 +1474,8 @@ namespace stream {
         break;
       }
 
-      server->iterate(150ms);
+      // RD: poll fast while a client draws the cursor so shape changes arrive quickly.
+      server->iterate(has_local_cursor ? 4ms : 150ms);
     }
 
     // Let all remaining connections know the server is shutting down
@@ -2316,6 +2384,11 @@ namespace stream {
       BOOST_LOG(debug) << "Resetting Input..."sv;
       input::reset(session.input);
 
+      if (session.control.rd_local_cursor) {
+        --rd_cursor::local_sessions;
+      }
+      rd_cursor::clear_battery(config::nvhttp.sunshine_name);
+
       // If this is the last session, invoke the platform callbacks
       if (--running_sessions == 0) {
         bool revert_display_config {config::video.dd.config_revert_on_disconnect};
@@ -2367,6 +2440,13 @@ namespace stream {
       session.audio.peer.port(0);
 
       session.pingTimeout = std::chrono::steady_clock::now() + config::stream.ping_timeout;
+
+      // RD: client draws the cursor; stop blending it into the video.
+      if (session.config.mlFeatureFlags & rd_cursor::FEATURE_LOCAL_CURSOR) {
+        session.control.rd_local_cursor = true;
+        ++rd_cursor::local_sessions;
+        BOOST_LOG(info) << "RD: client-drawn cursor enabled"sv;
+      }
 
       session.audioThread = std::jthread {audioThread, &session};
       session.videoThread = std::jthread {videoThread, &session};
